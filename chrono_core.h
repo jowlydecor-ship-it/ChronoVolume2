@@ -30,7 +30,9 @@ struct Params {
     float sliceOpacity = 0.9f;
     float trailFade = 0.3f;  // fades older frames (0..1)
 
-    float yaw = 25.f, pitch = 15.f, fov = 35.f, zoom = 1.f;
+    float yaw = 25.f, pitch = 15.f, roll = 0.f, fov = 35.f, zoom = 1.f;
+    float posX = 0.f, posY = 0.f;     // move the cube on screen (fractions of frame width/height)
+    float scaleW = 1.f, scaleH = 1.f; // cube width / height proportions
     float bend = 0.f;        // 0 = straight stack, 1 = closed ring
     int steps = 96;          // ray-march quality
 
@@ -169,7 +171,7 @@ private:
     int seed;
 
     // scene
-    float W = 1.78f, D = 1.5f, Rc = 1.f, theta = 0.f, tanV = 0.3f, tanH = 0.5f, rad = 1.f;
+    float W = 1.78f, Wc = 1.78f, Hc = 1.f, D = 1.5f, Rc = 1.f, theta = 0.f, tanV = 0.3f, tanH = 0.5f, rad = 1.f;
     bool bent = false;
     V3 cam{0, 0, -3}, fwd{0, 0, 1}, right{1, 0, 0}, up{0, 1, 0}, T{0, 0, 0};
     std::vector<float> bg; // temporal median background (RGB) for Motion Only
@@ -180,6 +182,8 @@ private:
         for (auto& f : frames) if (f.w > 0) { fw = f.w; fh = f.h; break; }
         W = fh > 0 ? (float)fw / (float)fh : (float)outW / (float)outH;
         D = std::max(0.05f, P.depth);
+        Wc = W * std::max(0.05f, P.scaleW);
+        Hc = std::max(0.05f, P.scaleH);
 
         float halfFov = std::max(2.f, std::min(120.f, P.fov)) * 0.5f * kPi / 180.f;
         tanV = std::tan(halfFov);
@@ -191,14 +195,14 @@ private:
         float R;
         if (!bent) {
             T = {0, 0, 0};
-            rad = 0.5f * std::sqrt(W * W + 1.f + D * D);
-            R = (0.5f / tanV + D * 0.5f) / zoom;
+            rad = 0.5f * std::sqrt(Wc * Wc + Hc * Hc + D * D);
+            R = (0.5f * Hc / tanV + D * 0.5f) / zoom;
         } else {
-            Rc = std::max(D / theta, 0.55f * W);
+            Rc = std::max(D / theta, 0.55f * Wc);
             float k = std::min(1.f, theta / (2.f * kPi));
             T = {-Rc * k, 0, 0};
-            float hx = Rc + W * 0.5f + Rc * (1.f - k);
-            rad = std::sqrt(hx * hx + 0.25f);
+            float hx = Rc + Wc * 0.5f + Rc * (1.f - k);
+            rad = std::sqrt(hx * hx + 0.25f * Hc * Hc);
             R = rad / std::sin(halfFov) / zoom;
         }
         float yaw = P.yaw * kPi / 180.f;
@@ -208,6 +212,11 @@ private:
         fwd = dir * -1.f;
         right = norm(cross({0, 1, 0}, fwd));
         up = cross(fwd, right);
+        {
+            float rl = P.roll * kPi / 180.f, cr = std::cos(rl), sr = std::sin(rl);
+            V3 r2 = right * cr + up * sr, u2 = up * cr - right * sr;
+            right = r2; up = u2;
+        }
 
         if (P.motionOnly && P.mode != -1 && fw > 0) {
             bgW = fw; bgH = fh;
@@ -278,8 +287,8 @@ private:
     bool evalVolume(float u, float v, float j, float rgb[3], float& m) const {
         float c[4];
         if (P.style == 1) { // voxel dust
-            float Gv = (float)std::max(4, P.dotGrid), Gu = Gv * W;
-            float su = u * Gu, sv = v * Gv;
+            float Gv = (float)std::max(4, P.dotGrid), Gu = Gv * Wc, Gv2 = Gv * Hc;
+            float su = u * Gu, sv = v * Gv2;
             int iu = (int)std::floor(su), iv = (int)std::floor(sv), jc = (int)std::lround(j);
             if (rand01(iu, iv, jc) > P.dotDensity) return false;
             float du = su - iu - 0.5f - (rand01(iu, iv, jc * 3 + 1) - 0.5f) * 0.5f;
@@ -287,7 +296,7 @@ private:
             float dw = (j - jc) * (D / (float)std::max(1, N - 1)) * Gv;
             float r = P.dotSize * 0.5f;
             if (du * du + dv * dv + dw * dw > r * r) return false;
-            float uc = (iu + 0.5f) / Gu, vc = (iv + 0.5f) / Gv;
+            float uc = (iu + 0.5f) / Gu, vc = (iv + 0.5f) / Gv2;
             sampleFrames((float)jc, uc, vc, c);
             m = opacityOf(c, uc, vc);
         } else {
@@ -305,15 +314,15 @@ private:
     }
 
     bool toVolume(const V3& p, float& u, float& v, float& w) const {
-        v = p.y + 0.5f;
+        v = p.y / Hc + 0.5f;
         if (v < 0.f || v > 1.f) return false;
         if (!bent) {
-            u = p.x / W + 0.5f;
+            u = p.x / Wc + 0.5f;
             w = p.z / D + 0.5f;
         } else {
             float rx = p.x + Rc, rz = p.z;
             float r = std::sqrt(rx * rx + rz * rz);
-            u = (r - Rc) / W + 0.5f;
+            u = (r - Rc) / Wc + 0.5f;
             w = std::atan2(rz, rx) / theta + 0.5f;
         }
         return u >= 0.f && u <= 1.f && w >= -1e-4f && w <= 1.f + 1e-4f;
@@ -321,7 +330,7 @@ private:
 
     bool hitBox(const V3& o, const V3& d, float& t0, float& t1) const {
         t0 = 0.f; t1 = 1e30f;
-        const float bmin[3] = {-W * 0.5f, -0.5f, -D * 0.5f}, bmax[3] = {W * 0.5f, 0.5f, D * 0.5f};
+        const float bmin[3] = {-Wc * 0.5f, -Hc * 0.5f, -D * 0.5f}, bmax[3] = {Wc * 0.5f, Hc * 0.5f, D * 0.5f};
         const float oo[3] = {o.x, o.y, o.z}, dd[3] = {d.x, d.y, d.z};
         for (int i = 0; i < 3; i++) {
             if (std::fabs(dd[i]) < 1e-8f) { if (oo[i] < bmin[i] || oo[i] > bmax[i]) return false; continue; }
@@ -363,7 +372,7 @@ private:
             return;
         }
 
-        float nx = ((x + 0.5f) / outW) * 2.f - 1.f, ny = ((y + 0.5f) / outH) * 2.f - 1.f;
+        float nx = ((x + 0.5f) / outW) * 2.f - 1.f - 2.f * P.posX, ny = ((y + 0.5f) / outH) * 2.f - 1.f - 2.f * P.posY;
         V3 d = norm(fwd + right * (nx * tanH) + up * (ny * tanV));
         float A = 0.f;
 
