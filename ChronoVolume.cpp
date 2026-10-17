@@ -96,14 +96,21 @@ private:
     RGBParam *keyColor_, *colorNew_, *colorOld_;
     RGBAParam* bg_;
 
+    // In this SDK version ChoiceParam only offers getValue(int&) / getValueAtTime(double, int&).
+    static int choiceAt(ChoiceParam* p, double t) {
+        int v = 0;
+        p->getValueAtTime(t, v);
+        return v;
+    }
+
     double D(const char* n, double t) { return d_[n]->getValueAtTime(t); }
 
     chrono::Params readParams(double t) {
         chrono::Params P;
-        P.mode = mode_->getValueAtTime(t);
-        P.style = style_->getValueAtTime(t);
-        P.opacitySrc = opacitySrc_->getValueAtTime(t);
-        P.colorMode = colorMode_->getValueAtTime(t);
+        P.mode = choiceAt(mode_, t);
+        P.style = choiceAt(style_, t);
+        P.opacitySrc = choiceAt(opacitySrc_, t);
+        P.colorMode = choiceAt(colorMode_, t);
         P.before = before_->getValueAtTime(t);
         P.after = after_->getValueAtTime(t);
         P.steps = steps_->getValueAtTime(t);
@@ -163,7 +170,8 @@ private:
 
 void ChronoVolumePlugin::changedParam(const InstanceChangedArgs& args, const std::string& name) {
     if (name != "preset" || args.reason != eChangeUserEdit) return;
-    int i = preset_->getValue();
+    int i = 0;
+    preset_->getValue(i);
     if (i < 0 || i >= kNumPresets) return;
     const Preset& p = kPresets[i];
     beginEditBlock("ChronoVolume preset");
