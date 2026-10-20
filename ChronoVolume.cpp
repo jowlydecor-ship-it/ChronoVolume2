@@ -12,7 +12,7 @@
 #include <string>
 #include <vector>
 
-#include "chrono_core.h"
+#include "chrono_presets.h"
 
 using namespace OFX;
 
@@ -24,27 +24,9 @@ using namespace OFX;
 
 namespace {
 
-// ---------------------------------------------------------------- presets
-struct Preset {
-    const char* name;
-    int mode, style, before, after, opacity;
-    double depth, bend, yaw, pitch, density, fade, glow, slopeX;
-    bool motion;
-};
-// mode: 0 solid, 1 translucent, 2 slices, 3 cross | style: 0 volume, 1 dust, 2 scan lines
-// opacity: 0 uniform, 1 luma
-const Preset kPresets[] = {
-    {"Default",           1, 0, 24, 0, 1, 1.5, 0.0, 25, 15,  6, 0.3, 0.0, 1.0, false},
-    {"Ghost Trail",       1, 0, 16, 0, 0, 1.2, 0.0,  0,  0,  4, 0.7, 0.3, 1.0, true},
-    {"Motion Sculpture",  1, 0, 40, 0, 0, 2.0, 0.0, 35, 12, 10, 0.0, 0.2, 1.0, true},
-    {"Solid Block",       0, 0, 30, 0, 0, 1.5, 0.0, 30, 20,  6, 0.0, 0.0, 1.0, false},
-    {"Time Ring",         1, 0, 48, 0, 0, 2.5, 1.0,  0, 55,  4, 0.0, 0.0, 1.0, false},
-    {"Slit Scan",         3, 0, 30, 30, 0, 1.5, 0.0,  0,  0,  6, 0.0, 0.0, 1.0, false},
-    {"Frame Stack",       2, 0, 20, 0, 0, 2.0, 0.0, 40, 15,  6, 0.0, 0.0, 1.0, false},
-    {"Data Cloud",        1, 1, 30, 0, 0, 1.5, 0.0, 30, 15, 12, 0.0, 0.3, 1.0, true},
-    {"Lidar Scan",        2, 2, 24, 0, 1, 1.8, 0.0, 30, 20,  6, 0.2, 0.5, 1.0, false},
-};
-const int kNumPresets = sizeof(kPresets) / sizeof(kPresets[0]);
+// Presets live in chrono_presets.h (shared with the preview tool).
+using chrono::kNumPresets;
+using chrono::kPresets;
 
 // ---------------------------------------------------------------- instance
 class ChronoVolumePlugin : public ImageEffect {
@@ -74,11 +56,14 @@ public:
         invert_ = fetchBooleanParam("invert");
 
         for (const char* n : {"depth", "density", "sliceOpacity", "trailFade", "yaw", "pitch", "fov", "zoom",
-                              "bend", "snap", "roll", "posX", "posY", "scaleW", "scaleH", "motionThresh", "motionSoft", "gain", "keyTol", "dotSize", "dotDensity",
+                              "bend", "snap", "shading", "edgeGlow", "frost", "floorReflect", "shadowAmt", "shadowSoft", "lightYaw", "lightPitch", "roll", "posX", "posY", "scaleW", "scaleH", "motionThresh", "motionSoft", "gain", "keyTol", "dotSize", "dotDensity",
                               "lineWidth", "colorMix", "crossPos", "crossSlopeX", "crossSlopeY", "glowAmt",
                               "glowRad", "glowThresh", "caAmt", "grain"})
             d_[n] = fetchDoubleParam(n);
 
+        aa_ = fetchIntParam("aa");
+        floorOn_ = fetchBooleanParam("floorOn");
+        floorColor_ = fetchRGBParam("floorColor");
         keyColor_ = fetchRGBParam("keyColor");
         colorNew_ = fetchRGBParam("colorNew");
         colorMid_ = fetchRGBParam("colorMid");
@@ -94,10 +79,10 @@ private:
     Clip *dstClip_, *srcClip_;
     ChoiceParam *preset_, *mode_, *style_, *opacitySrc_, *colorMode_, *motionMethod_;
     Double2DParam* orbit_;
-    IntParam *before_, *after_, *steps_, *dotGrid_, *lines_;
-    BooleanParam *loop_, *flip_, *blend_, *motionOnly_, *invert_;
+    IntParam *before_, *after_, *steps_, *dotGrid_, *lines_, *aa_;
+    BooleanParam *loop_, *flip_, *blend_, *motionOnly_, *invert_, *floorOn_;
     std::map<std::string, DoubleParam*> d_;
-    RGBParam *keyColor_, *colorNew_, *colorMid_, *colorOld_;
+    RGBParam *keyColor_, *colorNew_, *colorMid_, *colorOld_, *floorColor_;
     RGBAParam* bg_;
 
     // In this SDK version ChoiceParam only offers getValue(int&) / getValueAtTime(double, int&).
@@ -143,6 +128,16 @@ private:
         P.zoom = (float)D("zoom", t);
         P.bend = (float)D("bend", t);
         P.snap = (float)D("snap", t);
+        P.aa = aa_->getValueAtTime(t);
+        P.floorOn = floorOn_->getValueAtTime(t);
+        P.shading = (float)D("shading", t);
+        P.edgeGlow = (float)D("edgeGlow", t);
+        P.frost = (float)D("frost", t);
+        P.floorReflect = (float)D("floorReflect", t);
+        P.shadowAmt = (float)D("shadowAmt", t);
+        P.shadowSoft = (float)D("shadowSoft", t);
+        P.lightYaw = (float)D("lightYaw", t);
+        P.lightPitch = (float)D("lightPitch", t);
         P.roll = (float)D("roll", t);
         P.posX = (float)D("posX", t);
         P.posY = (float)D("posY", t);
@@ -169,6 +164,8 @@ private:
         P.keyColor[0] = (float)r; P.keyColor[1] = (float)g; P.keyColor[2] = (float)b;
         colorNew_->getValueAtTime(t, r, g, b);
         P.colorNew[0] = (float)r; P.colorNew[1] = (float)g; P.colorNew[2] = (float)b;
+        floorColor_->getValueAtTime(t, r, g, b);
+        P.floorColor[0] = (float)r; P.floorColor[1] = (float)g; P.floorColor[2] = (float)b;
         colorMid_->getValueAtTime(t, r, g, b);
         P.colorMid[0] = (float)r; P.colorMid[1] = (float)g; P.colorMid[2] = (float)b;
         colorOld_->getValueAtTime(t, r, g, b);
@@ -193,11 +190,12 @@ void ChronoVolumePlugin::changedParam(const InstanceChangedArgs& args, const std
     int i = 0;
     preset_->getValue(i);
     if (i < 0 || i >= kNumPresets) return;
-    const Preset& p = kPresets[i];
+    const chrono::Preset& p = kPresets[i];
     beginEditBlock("ChronoVolume preset");
     mode_->setValue(p.mode);
     style_->setValue(p.style);
     opacitySrc_->setValue(p.opacity);
+    colorMode_->setValue(p.colorMode);
     before_->setValue(p.before);
     after_->setValue(p.after);
     motionOnly_->setValue(p.motion);
@@ -208,7 +206,19 @@ void ChronoVolumePlugin::changedParam(const InstanceChangedArgs& args, const std
     d_["density"]->setValue(p.density);
     d_["trailFade"]->setValue(p.fade);
     d_["glowAmt"]->setValue(p.glow);
+    d_["glowRad"]->setValue(p.glowRad);
+    d_["zoom"]->setValue(chrono::presetZoom(p));
+    d_["posX"]->setValue(0.0);
+    d_["posY"]->setValue(0.0);
+    d_["roll"]->setValue(0.0);
     d_["crossSlopeX"]->setValue(p.slopeX);
+    d_["caAmt"]->setValue(p.ca);
+    d_["sliceOpacity"]->setValue(p.sliceOpacity);
+    d_["dotDensity"]->setValue(p.dotDensity);
+    d_["edgeGlow"]->setValue(p.edge);
+    d_["frost"]->setValue(p.frost);
+    floorOn_->setValue(p.studio);
+    bg_->setValue(0.0, 0.0, 0.0, 0.0);
     endEditBlock();
 }
 
@@ -396,7 +406,8 @@ void ChronoVolumeFactory::describeInContext(ImageEffectDescriptor& desc, Context
     Dbl("fov", "Field of View", 35, 5, 120, 10, 90, "Vertical field of view (degrees).");
     Dbl("zoom", "Zoom", 1, 0.05, 20, 0.2, 4, "1 = front face fills the frame at yaw 0 / pitch 0.");
     Dbl("bend", "Bend", 0, 0, 1, 0, 1, "0 = straight stack, 1 = closed time ring.");
-    Int("steps", "Quality (steps)", 96, 16, 512, "Ray-march steps. Higher = smoother, slower.");
+    Int("steps", "Quality (sub-slices)", 3, 1, 8, "Sub-slices computed between two frames. Higher = smoother volumes, slower (4-6 for solid sculptures).");
+    Int("aa", "Anti-aliasing", 2, 1, 4, "Samples per pixel axis (2 = 4 samples). 1 = fastest.");
 
     G("grpOpacity", "Opacity / Motion", false);
     Bool("motionOnly", "Motion Only", false, "Removes the static background (temporal median) so only motion leaves a trace.");
@@ -414,8 +425,20 @@ void ChronoVolumeFactory::describeInContext(ImageEffectDescriptor& desc, Context
     Dbl("sliceOpacity", "Slice Opacity", 0.9, 0, 1, 0, 1, "Opacity of each card in Separated Slices.");
     Dbl("trailFade", "Trail Fade", 0.3, 0, 1, 0, 1, "Fades older frames.");
 
+    G("grpLook", "Look / Studio", true);
+    Dbl("shading", "Shading", 0.6, 0, 1, 0, 1, "Surface lighting on solid blocks and depth shading inside volumes.");
+    Dbl("edgeGlow", "Edge Glow", 0, 0, 3, 0, 2, "Neon outline on slices, fresnel rim on solid blocks.");
+    Dbl("frost", "Frosted Glass", 0, 0, 1, 0, 1, "Blurs deeper slices (Separated Slices).");
+    Bool("floorOn", "Studio Floor", false, "White studio floor with soft shadow and reflection.");
+    Rgb("floorColor", "Floor Color", 0.93, 0.93, 0.95);
+    Dbl("floorReflect", "Floor Reflection", 0.25, 0, 1, 0, 1, "");
+    Dbl("shadowAmt", "Shadow Strength", 0.55, 0, 1, 0, 1, "");
+    Dbl("shadowSoft", "Shadow Softness", 0.5, 0, 1, 0, 1, "");
+    Dbl("lightYaw", "Light Direction", -35, -180, 180, -180, 180, "Horizontal angle of the key light (degrees).");
+    Dbl("lightPitch", "Light Height", 50, 5, 89, 5, 89, "Elevation of the key light (degrees).");
+
     G("grpStyle", "Style", false);
-    Choice("style", "Style", {"Smooth Volume", "Voxel Dust (Point Cloud)", "Scan Lines (Lidar)"}, 0, "");
+    Choice("style", "Style", {"Smooth Volume", "Voxel Dust (Point Cloud)", "Scan Lines (Lidar)"}, 0, "Dust and scan lines render on the frame planes.");
     Int("dotGrid", "Dust Grid", 60, 8, 300, "Dust cells per image height.");
     Dbl("dotSize", "Dust Size", 0.7, 0.05, 1.5, 0.05, 1.5, "");
     Dbl("dotDensity", "Dust Density", 0.35, 0, 1, 0, 1, "Fraction of cells that hold a particle.");
