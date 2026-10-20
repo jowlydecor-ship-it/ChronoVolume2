@@ -58,6 +58,8 @@ public:
         style_ = fetchChoiceParam("style");
         opacitySrc_ = fetchChoiceParam("opacitySrc");
         colorMode_ = fetchChoiceParam("colorMode");
+        motionMethod_ = fetchChoiceParam("motionMethod");
+        orbit_ = fetchDouble2DParam("orbit");
 
         before_ = fetchIntParam("framesBefore");
         after_ = fetchIntParam("framesAfter");
@@ -72,13 +74,14 @@ public:
         invert_ = fetchBooleanParam("invert");
 
         for (const char* n : {"depth", "density", "sliceOpacity", "trailFade", "yaw", "pitch", "fov", "zoom",
-                              "bend", "motionThresh", "motionSoft", "gain", "keyTol", "dotSize", "dotDensity",
+                              "bend", "snap", "roll", "posX", "posY", "scaleW", "scaleH", "motionThresh", "motionSoft", "gain", "keyTol", "dotSize", "dotDensity",
                               "lineWidth", "colorMix", "crossPos", "crossSlopeX", "crossSlopeY", "glowAmt",
                               "glowRad", "glowThresh", "caAmt", "grain"})
             d_[n] = fetchDoubleParam(n);
 
         keyColor_ = fetchRGBParam("keyColor");
         colorNew_ = fetchRGBParam("colorNew");
+        colorMid_ = fetchRGBParam("colorMid");
         colorOld_ = fetchRGBParam("colorOld");
         bg_ = fetchRGBAParam("bgColor");
     }
@@ -89,11 +92,12 @@ public:
 
 private:
     Clip *dstClip_, *srcClip_;
-    ChoiceParam *preset_, *mode_, *style_, *opacitySrc_, *colorMode_;
+    ChoiceParam *preset_, *mode_, *style_, *opacitySrc_, *colorMode_, *motionMethod_;
+    Double2DParam* orbit_;
     IntParam *before_, *after_, *steps_, *dotGrid_, *lines_;
     BooleanParam *loop_, *flip_, *blend_, *motionOnly_, *invert_;
     std::map<std::string, DoubleParam*> d_;
-    RGBParam *keyColor_, *colorNew_, *colorOld_;
+    RGBParam *keyColor_, *colorNew_, *colorMid_, *colorOld_;
     RGBAParam* bg_;
 
     // In this SDK version ChoiceParam only offers getValue(int&) / getValueAtTime(double, int&).
@@ -111,6 +115,7 @@ private:
         P.style = choiceAt(style_, t);
         P.opacitySrc = choiceAt(opacitySrc_, t);
         P.colorMode = choiceAt(colorMode_, t);
+        P.motionMethod = choiceAt(motionMethod_, t);
         P.before = before_->getValueAtTime(t);
         P.after = after_->getValueAtTime(t);
         P.steps = steps_->getValueAtTime(t);
@@ -127,9 +132,22 @@ private:
         P.trailFade = (float)D("trailFade", t);
         P.yaw = (float)D("yaw", t);
         P.pitch = (float)D("pitch", t);
+        {   // on-screen handle: centre = no extra rotation; drag to orbit
+            double ox = 0.5, oy = 0.5;
+            orbit_->getValueAtTime(t, ox, oy);
+            if (ox < -1.0 || ox > 2.0 || oy < -1.0 || oy > 2.0) { ox = 0.5; oy = 0.5; } // host gave pixels: ignore
+            P.yaw += (float)((ox - 0.5) * 360.0);
+            P.pitch += (float)((oy - 0.5) * 180.0);
+        }
         P.fov = (float)D("fov", t);
         P.zoom = (float)D("zoom", t);
         P.bend = (float)D("bend", t);
+        P.snap = (float)D("snap", t);
+        P.roll = (float)D("roll", t);
+        P.posX = (float)D("posX", t);
+        P.posY = (float)D("posY", t);
+        P.scaleW = (float)D("scaleW", t);
+        P.scaleH = (float)D("scaleH", t);
         P.motionThresh = (float)D("motionThresh", t);
         P.motionSoft = (float)D("motionSoft", t);
         P.gain = (float)D("gain", t);
@@ -151,6 +169,8 @@ private:
         P.keyColor[0] = (float)r; P.keyColor[1] = (float)g; P.keyColor[2] = (float)b;
         colorNew_->getValueAtTime(t, r, g, b);
         P.colorNew[0] = (float)r; P.colorNew[1] = (float)g; P.colorNew[2] = (float)b;
+        colorMid_->getValueAtTime(t, r, g, b);
+        P.colorMid[0] = (float)r; P.colorMid[1] = (float)g; P.colorMid[2] = (float)b;
         colorOld_->getValueAtTime(t, r, g, b);
         P.colorOld[0] = (float)r; P.colorOld[1] = (float)g; P.colorOld[2] = (float)b;
         bg_->getValueAtTime(t, r, g, b, a);
@@ -352,10 +372,27 @@ void ChronoVolumeFactory::describeInContext(ImageEffectDescriptor& desc, Context
     Bool("loop", "Loop Footage", false, "Wrap time around the clip instead of clamping at its ends.");
     Bool("blend", "Frame Blend", true, "Blends neighbouring frames for smoother volumes (not optical flow).");
 
+    G("grpTransition", "Transition", true);
+    Dbl("snap", "Snap to Front", 0, 0, 1, 0, 1, "0 = 3D block, 1 = collapsed flat onto the original video. Animate it to transition in/out.");
+
     G("grpCamera", "Camera / Shape", true);
+    {
+        Double2DParamDescriptor* o = desc.defineDouble2DParam("orbit");
+        o->setLabels("Orbit Handle", "Orbit Handle", "Orbit Handle");
+        o->setDoubleType(eDoubleTypeXYAbsolute);
+        o->setDefaultCoordinateSystem(eCoordinatesNormalised);
+        o->setDefault(0.5, 0.5);
+        o->setHint("Drag this point in the viewer to rotate the cube (centre = no extra rotation).");
+        place(o);
+    }
     Dbl("depth", "Depth", 1.5, 0.05, 20, 0.2, 5, "Depth of the time block, in image heights.");
     Dbl("yaw", "Yaw", 25, -360, 360, -180, 180, "Orbit around the vertical axis (degrees).");
     Dbl("pitch", "Pitch", 15, -89, 89, -89, 89, "Orbit elevation (degrees).");
+    Dbl("roll", "Roll", 0, -360, 360, -180, 180, "Tilts the view around the viewing axis (degrees).");
+    Dbl("posX", "Position X", 0, -3, 3, -1, 1, "Moves the cube left/right (fraction of frame width).");
+    Dbl("posY", "Position Y", 0, -3, 3, -1, 1, "Moves the cube up/down (fraction of frame height).");
+    Dbl("scaleW", "Cube Width", 1, 0.05, 5, 0.1, 3, "Stretches the cube horizontally.");
+    Dbl("scaleH", "Cube Height", 1, 0.05, 5, 0.1, 3, "Stretches the cube vertically.");
     Dbl("fov", "Field of View", 35, 5, 120, 10, 90, "Vertical field of view (degrees).");
     Dbl("zoom", "Zoom", 1, 0.05, 20, 0.2, 4, "1 = front face fills the frame at yaw 0 / pitch 0.");
     Dbl("bend", "Bend", 0, 0, 1, 0, 1, "0 = straight stack, 1 = closed time ring.");
@@ -365,6 +402,8 @@ void ChronoVolumeFactory::describeInContext(ImageEffectDescriptor& desc, Context
     Bool("motionOnly", "Motion Only", false, "Removes the static background (temporal median) so only motion leaves a trace.");
     Dbl("motionThresh", "Motion Threshold", 0.06, 0, 1, 0, 0.5, "Difference to the background needed to count as motion.");
     Dbl("motionSoft", "Motion Softness", 0.08, 0, 1, 0, 0.5, "Softness of the motion mask.");
+    Choice("motionMethod", "Motion Method", {"Background (median)", "Frame Difference"}, 0,
+           "Background: removes the static decor. Frame Difference: keeps what differs from adjacent frames.");
     Choice("opacitySrc", "Opacity From", {"Uniform", "Luma", "Brightness (Max)", "Saturation", "Chroma Key", "Alpha"}, 1,
            "What makes a voxel opaque.");
     Rgb("keyColor", "Key Color", 0, 1, 0);
@@ -382,10 +421,11 @@ void ChronoVolumeFactory::describeInContext(ImageEffectDescriptor& desc, Context
     Dbl("dotDensity", "Dust Density", 0.35, 0, 1, 0, 1, "Fraction of cells that hold a particle.");
     Int("lines", "Scan Lines", 48, 4, 400, "Lines per image height.");
     Dbl("lineWidth", "Line Width", 0.25, 0.02, 1, 0.02, 1, "Lit fraction of each line period.");
-    Choice("colorMode", "Color", {"Source", "Tint by Age"}, 0, "");
-    Rgb("colorNew", "Newest Color", 1, 0.6, 0.2);
-    Rgb("colorOld", "Oldest Color", 0.2, 0.5, 1);
-    Dbl("colorMix", "Tint Amount", 0.6, 0, 1, 0, 1, "");
+    Choice("colorMode", "Color", {"Source", "Time Age Mapping"}, 0, "Age mapping: present -> near past -> far past.");
+    Rgb("colorNew", "Present Color", 1, 1, 1);
+    Rgb("colorMid", "Near Past Color", 0.2, 0.4, 1);
+    Rgb("colorOld", "Far Past Color", 1, 0.2, 0.2);
+    Dbl("colorMix", "Age Color Amount", 0.8, 0, 1, 0, 1, "");
 
     G("grpCross", "Cross Section", false);
     Dbl("crossPos", "Position", 0.5, 0, 1, 0, 1, "Where the plane crosses the time stack.");

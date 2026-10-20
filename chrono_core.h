@@ -36,6 +36,8 @@ struct Params {
     float bend = 0.f;        // 0 = straight stack, 1 = closed ring
     int steps = 96;          // ray-march quality
 
+    float snap = 0.f;        // Snap to Front: 0 = 3D block, 1 = flat on the original video
+    int motionMethod = 0;    // 0 background (temporal median), 1 difference with adjacent frames
     bool motionOnly = false;
     float motionThresh = 0.06f, motionSoft = 0.08f;
 
@@ -51,9 +53,10 @@ struct Params {
     float lineWidth = 0.25f; // fraction of a line period that is lit
 
     int colorMode = 0;       // 0 source colours, 1 tint by age
-    float colorNew[3] = {1.f, 0.6f, 0.2f};
-    float colorOld[3] = {0.2f, 0.5f, 1.f};
-    float colorMix = 0.6f;
+    float colorNew[3] = {1.f, 1.f, 1.f};   // present
+    float colorMid[3] = {0.2f, 0.4f, 1.f}; // near past
+    float colorOld[3] = {1.f, 0.2f, 0.2f}; // far past
+    float colorMix = 0.8f;
 
     float crossPos = 0.5f, crossSlopeX = 1.f, crossSlopeY = 0.f;
 
@@ -160,11 +163,25 @@ public:
             for (int y = a; y < b; y++)
                 for (int x = 0; x < outW; x++) shade(x, y, &out[((size_t)y * outW + x) * 4]);
         });
+        if (P.snap > 0.f && N > 0) { // blend onto the current source frame
+            int cj = std::min(std::max(P.flip ? P.before : P.after, 0), N - 1);
+            float sn = clamp01(P.snap);
+            parallelRows(0, outH, [&](int a, int b) {
+                for (int y = a; y < b; y++)
+                    for (int x = 0; x < outW; x++) {
+                        float c[4];
+                        frames[cj].bilinear((x + 0.5f) / outW, (y + 0.5f) / outH, c);
+                        float* o = &out[((size_t)y * outW + x) * 4];
+                        for (int k = 0; k < 3; k++) o[k] = o[k] * (1.f - sn) + c[k] * c[3] * sn;
+                        o[3] = o[3] * (1.f - sn) + c[3] * sn;
+                    }
+            });
+        }
         post(out);
     }
 
 private:
-    const Params& P;
+    Params P;
     const std::vector<FrameView>& frames;
     int N, outW, outH;
     float rs;
@@ -178,6 +195,13 @@ private:
     int bgW = 0, bgH = 0;
 
     void prepare() {
+        if (P.snap > 0.f) { // pull the whole structure back onto the flat video
+            float k = 1.f - clamp01(P.snap);
+            P.yaw *= k; P.pitch *= k; P.roll *= k; P.posX *= k; P.posY *= k; P.bend *= k;
+            P.scaleW = 1.f + (P.scaleW - 1.f) * k; P.scaleH = 1.f + (P.scaleH - 1.f) * k;
+            P.zoom = 1.f + (P.zoom - 1.f) * k;
+            P.depth = std::max(0.05f, P.depth * k);
+        }
         int fw = 0, fh = 0;
         for (auto& f : frames) if (f.w > 0) { fw = f.w; fh = f.h; break; }
         W = fh > 0 ? (float)fw / (float)fh : (float)outW / (float)outH;
@@ -218,7 +242,7 @@ private:
             right = r2; up = u2;
         }
 
-        if (P.motionOnly && P.mode != -1 && fw > 0) {
+        if (P.motionOnly && P.motionMethod == 0 && fw > 0) {
             bgW = fw; bgH = fh;
             bg.assign((size_t)bgW * bgH * 3, 0.f);
             parallelRows(0, bgH, [&](int a, int b) {
@@ -252,7 +276,7 @@ private:
         }
     }
 
-    float opacityOf(const float c[4], float u, float v) const {
+    float opacityOf(const float c[4], float u, float v, float j) const {
         float m = 1.f;
         switch (P.opacitySrc) {
             case 1: m = 0.2126f * c[0] + 0.7152f * c[1] + 0.0722f * c[2]; break;
@@ -273,11 +297,23 @@ private:
         }
         m = clamp01(m * P.gain);
         if (P.invert) m = 1.f - m;
-        if (P.motionOnly && bgW > 0) {
-            int bx = std::min(std::max((int)(u * bgW), 0), bgW - 1);
-            int by = std::min(std::max((int)(v * bgH), 0), bgH - 1);
-            const float* b = &bg[((size_t)by * bgW + bx) * 3];
-            float d = std::max(std::fabs(c[0] - b[0]), std::max(std::fabs(c[1] - b[1]), std::fabs(c[2] - b[2])));
+        if (P.motionOnly) {
+            float d = 0.f;
+            if (P.motionMethod == 1) { // difference with the adjacent frames of the stack
+                int i = std::min(std::max((int)std::lround(j), 0), N - 1);
+                for (int o = -1; o <= 1; o += 2) {
+                    int k = i + o;
+                    if (k < 0 || k >= N) continue;
+                    float a[4];
+                    frames[k].bilinear(u, v, a);
+                    d = std::max(d, std::max(std::fabs(c[0] - a[0]), std::max(std::fabs(c[1] - a[1]), std::fabs(c[2] - a[2]))));
+                }
+            } else if (bgW > 0) {
+                int bx = std::min(std::max((int)(u * bgW), 0), bgW - 1);
+                int by = std::min(std::max((int)(v * bgH), 0), bgH - 1);
+                const float* b = &bg[((size_t)by * bgW + bx) * 3];
+                d = std::max(std::fabs(c[0] - b[0]), std::max(std::fabs(c[1] - b[1]), std::fabs(c[2] - b[2])));
+            }
             m *= sstep(P.motionThresh, P.motionThresh + P.motionSoft + 1e-4f, d);
         }
         return m;
@@ -298,7 +334,7 @@ private:
             if (du * du + dv * dv + dw * dw > r * r) return false;
             float uc = (iu + 0.5f) / Gu, vc = (iv + 0.5f) / Gv2;
             sampleFrames((float)jc, uc, vc, c);
-            m = opacityOf(c, uc, vc);
+            m = opacityOf(c, uc, vc, (float)jc);
         } else {
             if (P.style == 2) { // scan lines
                 float f = v * (float)std::max(1, P.lines);
@@ -306,7 +342,7 @@ private:
                 if (f > P.lineWidth) return false;
             }
             sampleFrames(j, u, v, c);
-            m = opacityOf(c, u, v);
+            m = opacityOf(c, u, v, j);
         }
         if (m <= 0.f) return false;
         rgb[0] = c[0]; rgb[1] = c[1]; rgb[2] = c[2];
@@ -352,7 +388,8 @@ private:
     void tint(float rgb[3], float w) const {
         if (P.colorMode != 1) return;
         for (int k = 0; k < 3; k++) {
-            float t = P.colorNew[k] * (1.f - w) + P.colorOld[k] * w;
+            float t = w < 0.5f ? P.colorNew[k] + (P.colorMid[k] - P.colorNew[k]) * (w * 2.f)
+                               : P.colorMid[k] + (P.colorOld[k] - P.colorMid[k]) * ((w - 0.5f) * 2.f);
             rgb[k] = rgb[k] * (1.f - P.colorMix) + t * P.colorMix;
         }
     }
@@ -366,7 +403,7 @@ private:
             j = std::min(std::max(j, 0.f), (float)(N - 1));
             float c[4];
             sampleFrames(j, u, v, c);
-            float a = P.motionOnly ? opacityOf(c, u, v) : 1.f;
+            float a = P.motionOnly ? opacityOf(c, u, v, j) : 1.f;
             C[0] = c[0] * a; C[1] = c[1] * a; C[2] = c[2] * a;
             finish(C, a, out);
             return;
