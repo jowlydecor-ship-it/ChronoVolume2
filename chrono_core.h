@@ -28,7 +28,8 @@ struct Params {
     bool blend = true;       // blend neighbouring frames (cheap smoothing, NOT optical flow)
 
     float depth = 1.5f;      // depth of the time block, in image heights
-    float density = 6.f;     // translucent density
+    float density = 3.f;     // translucent absorption density
+    float emission = 1.f;    // translucent / dust emission (glow accumulation)
     float sliceOpacity = 0.9f;
     float trailFade = 0.3f;  // fades older frames (0..1)
 
@@ -36,6 +37,7 @@ struct Params {
     float posX = 0.f, posY = 0.f;     // move the cube on screen (fractions of frame width/height)
     float scaleW = 1.f, scaleH = 1.f; // cube width / height proportions
     float bend = 0.f;        // 0 = straight stack, 1 = closed ring
+    int timeBase = 0;        // absolute frame number of the current time (keeps dust attached to its frame)
     int steps = 3;           // quality: sub-slices per frame gap (1..8)
     int aa = 2;              // anti-aliasing: samples per axis (1..4)
 
@@ -75,6 +77,7 @@ struct Params {
     float lightYaw = -35.f, lightPitch = 50.f;
 
     float glowAmt = 0.f, glowRad = 12.f, glowThresh = 0.6f;
+    float rolloff = 0.6f;    // highlight roll-off (soft clip, blown cores go white)
     float caAmt = 0.f;       // chromatic aberration, pixels at the image corner
     float grain = 0.f;
 
@@ -175,30 +178,92 @@ public:
     Renderer(const Params& p, const std::vector<FrameView>& f, int w, int h, float renderScale, uint32_t seed)
         : P(p), frames(f), N((int)f.size()), outW(w), outH(h), rs(renderScale), seed((int)seed) {}
 
-    // out: outW*outH*4 floats, premultiplied RGBA, row 0 = bottom.
+    // out: outW*outH*4 floats, premultiplied RGBA, row 0 = bottom. (No finishing pass: see postProcess.)
     void run(std::vector<float>& out) {
         out.assign((size_t)outW * outH * 4, 0.f);
         if (N <= 0 || outW <= 0 || outH <= 0) return;
         prepare();
+        const size_t npx = (size_t)outW * outH;
+
+        // 1. one ray per pixel
+        std::vector<float> vol(npx * 4, 0.f);
         parallelRows(0, outH, [&](int a, int b) {
             for (int y = a; y < b; y++)
-                for (int x = 0; x < outW; x++) shadePixel(x, y, &out[((size_t)y * outW + x) * 4]);
+                for (int x = 0; x < outW; x++) {
+                    float* o = &vol[((size_t)y * outW + x) * 4];
+                    traceVolume(cam, rayDir((x + 0.5f) / outW, (y + 0.5f) / outH), false, o, o[3]);
+                }
         });
-        if (P.snap > 0.f) { // blend onto the current source frame
-            int cj = std::min(std::max(P.flip ? P.before : P.after, 0), N - 1);
-            float sn = clamp01(P.snap);
+
+        // 2. adaptive anti-aliasing: only pixels on an edge get extra samples
+        const int g = std::max(1, std::min(4, P.aa));
+        if (g > 1) {
+            std::vector<float> v2 = vol;
             parallelRows(0, outH, [&](int a, int b) {
                 for (int y = a; y < b; y++)
                     for (int x = 0; x < outW; x++) {
-                        float c[4];
-                        frames[cj].bilinear((x + 0.5f) / outW, (y + 0.5f) / outH, c);
-                        float* o = &out[((size_t)y * outW + x) * 4];
-                        for (int k = 0; k < 3; k++) o[k] = o[k] * (1.f - sn) + c[k] * c[3] * sn;
-                        o[3] = o[3] * (1.f - sn) + c[3] * sn;
+                        if (!edgeAt(vol, x, y)) continue;
+                        float acc[4] = {0, 0, 0, 0};
+                        for (int sy = 0; sy < g; sy++)
+                            for (int sx = 0; sx < g; sx++) {
+                                float C[3], A;
+                                traceVolume(cam, rayDir((x + (sx + 0.5f) / g) / outW, (y + (sy + 0.5f) / g) / outH), false, C, A);
+                                acc[0] += C[0]; acc[1] += C[1]; acc[2] += C[2]; acc[3] += A;
+                            }
+                        float* o = &v2[((size_t)y * outW + x) * 4];
+                        for (int k = 0; k < 4; k++) o[k] = acc[k] / (float)(g * g);
+                    }
+            });
+            vol.swap(v2);
+        }
+
+        // 3. studio floor (shadow + reflection) on a coarse grid, interpolated per pixel
+        const int cell = 3;
+        const int gw = (outW + cell - 1) / cell + 2, gh = (outH + cell - 1) / cell + 2;
+        std::vector<float> fgrid;
+        if (floorActive) {
+            fgrid.assign((size_t)gw * gh * 3, 0.f);
+            parallelRows(0, gh, [&](int a, int b) {
+                for (int gy = a; gy < b; gy++)
+                    for (int gx = 0; gx < gw; gx++) {
+                        int px = std::min(gx * cell, outW - 1), py = std::min(gy * cell, outH - 1);
+                        float maxFree = 0.f;
+                        const int ox[5] = {0, cell, -cell, 0, 0}, oy[5] = {0, 0, 0, cell, -cell};
+                        for (int k = 0; k < 5; k++) {
+                            int qx = std::min(std::max(px + ox[k], 0), outW - 1), qy = std::min(std::max(py + oy[k], 0), outH - 1);
+                            maxFree = std::max(maxFree, 1.f - vol[((size_t)qy * outW + qx) * 4 + 3]);
+                        }
+                        float* F = &fgrid[((size_t)gy * gw + gx) * 3];
+                        if (maxFree < 0.004f) { F[0] = P.floorColor[0]; F[1] = P.floorColor[1]; F[2] = P.floorColor[2]; continue; }
+                        floorColor(rayDir((px + 0.5f) / outW, (py + 0.5f) / outH), px, py, F);
                     }
             });
         }
-        post(out);
+
+        // 4. composite the volume over the floor / background
+        parallelRows(0, outH, [&](int a, int b) {
+            for (int y = a; y < b; y++)
+                for (int x = 0; x < outW; x++) {
+                    const float* v = &vol[((size_t)y * outW + x) * 4];
+                    float F[3] = {P.bg[0], P.bg[1], P.bg[2]}, Fa = P.bg[3];
+                    if (floorActive) {
+                        Fa = 1.f;
+                        float fx = (float)x / cell, fy = (float)y / cell;
+                        int x0 = (int)fx, y0 = (int)fy;
+                        float tx = fx - x0, ty = fy - y0;
+                        const float *p00 = &fgrid[((size_t)y0 * gw + x0) * 3], *p10 = p00 + 3,
+                                    *p01 = &fgrid[((size_t)(y0 + 1) * gw + x0) * 3], *p11 = p01 + 3;
+                        for (int k = 0; k < 3; k++)
+                            F[k] = (p00[k] * (1 - tx) + p10[k] * tx) * (1 - ty) + (p01[k] * (1 - tx) + p11[k] * tx) * ty;
+                    }
+                    float* o = &out[((size_t)y * outW + x) * 4];
+                    float free_ = 1.f - v[3];
+                    o[0] = v[0] + free_ * F[0];
+                    o[1] = v[1] + free_ * F[1];
+                    o[2] = v[2] + free_ * F[2];
+                    o[3] = v[3] + free_ * Fa;
+                }
+        });
     }
 
 private:
@@ -214,6 +279,7 @@ private:
     float floorY = -0.5f;
     V3 cam{0, 0, -3}, fwd{0, 0, 1}, right{1, 0, 0}, up{0, 1, 0}, T{0, 0, 0}, L{0, 1, 0};
     float avgCol[3] = {0.5f, 0.5f, 0.5f};
+    int refW = 1, refH = 1;
     std::vector<float> bg; // temporal median background (RGB) for Motion Only
     int bgW = 0, bgH = 0;
 
@@ -230,6 +296,7 @@ private:
 
         int fw = 0, fh = 0;
         for (auto& f : frames) if (f.w > 0) { fw = f.w; fh = f.h; break; }
+        refW = std::max(1, fw); refH = std::max(1, fh);
         W = fh > 0 ? (float)fw / (float)fh : (float)outW / (float)outH;
         D = std::max(0.05f, P.depth);
         Wc = W * std::max(0.05f, P.scaleW);
@@ -286,16 +353,20 @@ private:
         }
 
         if (P.motionOnly && P.motionMethod == 0 && fw > 0) {
-            bgW = fw; bgH = fh;
+            const int stride = fw >= 640 ? 2 : 1;
+            bgW = (fw + stride - 1) / stride; bgH = (fh + stride - 1) / stride;
             bg.assign((size_t)bgW * bgH * 3, 0.f);
+            const int K = std::max(1, std::min(N, 9));
+            int idx[9];
+            for (int i = 0; i < K; i++) idx[i] = K > 1 ? (int)std::lround(i * (N - 1) / (float)(K - 1)) : 0;
             parallelRows(0, bgH, [&](int a, int b) {
-                std::vector<float> tmp(std::max(1, N));
+                float tmp[9];
                 for (int y = a; y < b; y++)
                     for (int x = 0; x < bgW; x++)
                         for (int c = 0; c < 3; c++) {
-                            for (int j = 0; j < N; j++) tmp[j] = frames[j].px(x, y)[c];
-                            std::nth_element(tmp.begin(), tmp.begin() + N / 2, tmp.begin() + N);
-                            bg[((size_t)y * bgW + x) * 3 + c] = tmp[N / 2];
+                            for (int k = 0; k < K; k++) tmp[k] = frames[idx[k]].px(x * stride, y * stride)[c];
+                            std::nth_element(tmp, tmp + K / 2, tmp + K);
+                            bg[((size_t)y * bgW + x) * 3 + c] = tmp[K / 2];
                         }
             });
         }
@@ -394,9 +465,10 @@ private:
             float Gv = (float)std::max(4, P.dotGrid), Gu = Gv * Wc, Gv2 = Gv * Hc;
             float su = u * Gu, sv = v * Gv2;
             int iu = (int)std::floor(su), iv = (int)std::floor(sv), jc = (int)std::lround(j);
-            if (rand01(iu, iv, jc) > P.dotDensity) return false;
-            float du = su - iu - 0.5f - (rand01(iu, iv, jc * 3 + 1) - 0.5f) * 0.5f;
-            float dv = sv - iv - 0.5f - (rand01(iu, iv, jc * 3 + 2) - 0.5f) * 0.5f;
+            const int fid = P.timeBase + (P.flip ? (jc - P.before) : (P.after - jc)); // stays attached to its video frame
+            if (rand01(iu, iv, fid) > P.dotDensity) return false;
+            float du = su - iu - 0.5f - (rand01(iu, iv, fid * 3 + 1) - 0.5f) * 0.5f;
+            float dv = sv - iv - 0.5f - (rand01(iu, iv, fid * 3 + 2) - 0.5f) * 0.5f;
             float r = P.dotSize * 0.5f, dd = std::sqrt(du * du + dv * dv);
             if (dd > r) return false;
             float uc = (iu + 0.5f) / Gu, vc = (iv + 0.5f) / Gv2;
@@ -542,6 +614,30 @@ private:
         }
     }
 
+    // Lit relief for masked solids (motion sculptures): normal from the opacity gradient of the volume.
+    void shadeSculpture(float u, float v, float jf, const V3& d, float rgb[3]) const {
+        auto mv = [&](float uu, float vv, float jj) {
+            float c[3], mm;
+            jj = std::min(std::max(jj, 0.f), (float)(N - 1));
+            float ww = N > 1 ? jj / (float)(N - 1) : 0.5f;
+            return evalVolume(uu, vv, jj, ww, c, mm, true) ? mm : 0.f;
+        };
+        float du = 1.5f / (float)refW, dv = 1.5f / (float)refH, dj = 0.6f;
+        float gx = (mv(u + du, v, jf) - mv(u - du, v, jf)) / (2.f * du * Wc);
+        float gy = (mv(u, v + dv, jf) - mv(u, v - dv, jf)) / (2.f * dv * Hc);
+        float gz = (mv(u, v, jf + dj) - mv(u, v, jf - dj)) / (2.f * dj) * (float)std::max(1, N - 1) / D;
+        V3 n{-gx, -gy, -gz};
+        float len = std::sqrt(dot(n, n));
+        n = len < 1e-4f ? V3{0, 0, -1} : norm(n * (1.f / len) + V3{0, 0, -0.35f});
+        float s = P.shading;
+        float ndl = std::max(0.f, dot(n, L));
+        float lit = (1.f - s) + s * (0.35f + 0.65f * ndl);
+        V3 H = norm(L - d);
+        float spec = std::pow(std::max(0.f, dot(n, H)), 40.f) * 0.35f * s;
+        float rim = std::pow(1.f - std::fabs(dot(n, d)), 3.f) * P.edgeGlow * 0.4f;
+        for (int k = 0; k < 3; k++) rgb[k] = rgb[k] * lit + spec + rim * (0.5f + 0.5f * rgb[k]);
+    }
+
     // One time-plane crossed by the ray: sample, shade and composite front-to-back.
     void addPlane(const V3& o, const V3& d, float t, float w, float denomQ, const V3& n, bool cards, bool shadow,
                   float C[3], float& A) const {
@@ -554,26 +650,38 @@ private:
         if (!evalVolume(u, v, jf, w, rgb, m, shadow)) return;
         m *= 1.f - P.trailFade * w;
 
-        float a;
+        float a, thick = 0.f;
         if (cards) a = clamp01(m * P.sliceOpacity);
         else if (P.mode == 0) a = sstep(0.25f, 0.6f, m);
         else {
             float spacing = (bent ? std::sqrt((p.x + Rc) * (p.x + Rc) + p.z * p.z) * theta : D) / denomQ;
             float cosT = std::max(0.08f, std::fabs(dot(d, n)));
-            a = 1.f - std::exp(-P.density * m * std::min(spacing / cosT, spacing * 8.f));
+            thick = std::min(spacing / cosT, spacing * 8.f);
+            a = 1.f - std::exp(-P.density * m * thick);
         }
         if (shadow) { A += (1.f - A) * a; return; }
 
         tint(rgb, w);
+        if (P.mode == 0 && !cards && !bent && a > 0.15f && P.shading > 0.f) shadeSculpture(u, v, jf, d, rgb);
         const float cue = 1.f - 0.45f * P.shading * w; // soft depth cue / ambient occlusion feel
         float Cp[3] = {a * rgb[0] * cue, a * rgb[1] * cue, a * rgb[2] * cue}, ap = a;
+
+        // emission: bright regions accumulate light (white-hot cores), like a glowing medium
+        float emit = 0.f;
+        if (cards && P.style != 0) emit = P.emission * m * 0.6f;
+        else if (!cards && P.mode == 1) emit = P.emission * m * thick;
+        if (emit > 0.f) {
+            for (int k = 0; k < 3; k++) Cp[k] += emit * rgb[k] * cue;
+            ap = a + (1.f - a) * std::min(1.f, emit);
+        }
+
         if (P.mode == 2 && P.style == 0 && P.edgeGlow > 0.f) { // neon-like outline of each pane
             float ed = std::min(std::min(u * Wc, (1.f - u) * Wc), std::min(v * Hc, (1.f - v) * Hc));
             float eg = P.edgeGlow * std::exp(-ed / 0.012f) * (1.f - 0.6f * w);
             if (eg > 0.002f) {
                 float ae = std::min(1.f, eg);
-                for (int k = 0; k < 3; k++) Cp[k] += (1.f - a) * ae * (rgb[k] * 0.5f + 0.5f);
-                ap = a + (1.f - a) * ae;
+                for (int k = 0; k < 3; k++) Cp[k] += (1.f - ap) * ae * (rgb[k] * 0.5f + 0.5f);
+                ap = ap + (1.f - ap) * ae;
             }
         }
         for (int k = 0; k < 3; k++) C[k] += (1.f - A) * Cp[k];
@@ -655,7 +763,8 @@ private:
         V3 t1 = norm(cross(L, std::fabs(L.y) > 0.9f ? V3{1, 0, 0} : V3{0, 1, 0}));
         V3 t2 = cross(L, t1);
         float size = 0.04f + 0.30f * P.shadowSoft;
-        float rot = rand01(x, y, seed + 31) * 2.f * kPi, sum = 0.f;
+        float ign = std::fmod(52.9829189f * std::fmod(0.06711056f * (float)x + 0.00583715f * (float)y, 1.f), 1.f);
+        float rot = ign * 2.f * kPi, sum = 0.f;
         for (int k = 0; k < K; k++) {
             float r = std::sqrt((k + 0.5f) / K) * size, a = rot + k * 2.39996f;
             V3 dl = norm(L + t1 * (std::cos(a) * r) + t2 * (std::sin(a) * r));
@@ -694,36 +803,25 @@ private:
         for (int k = 0; k < 3; k++) out[k] = col[k] * (1.f - f) + base[k] * f;
     }
 
-    // ------------------------------------------------------------ pixel
-    void shadePixel(int x, int y, float out[4]) const {
-        const int g = std::max(1, std::min(4, P.aa)), ns = g * g;
-        float subC[16][3], subA[16], minFree = 1.f;
-        for (int sy = 0; sy < g; sy++)
-            for (int sx = 0; sx < g; sx++) {
-                int k = sy * g + sx;
-                V3 d = rayDir((x + (sx + 0.5f) / g) / outW, (y + (sy + 0.5f) / g) / outH);
-                traceVolume(cam, d, false, subC[k], subA[k]);
-                minFree = std::min(minFree, 1.f - subA[k]);
-            }
-        float F[3] = {P.bg[0], P.bg[1], P.bg[2]}, Fa = P.bg[3];
-        if (floorActive) {
-            Fa = 1.f;
-            if (minFree > 0.004f) floorColor(rayDir((x + 0.5f) / outW, (y + 0.5f) / outH), x, y, F);
-            else { F[0] = P.floorColor[0]; F[1] = P.floorColor[1]; F[2] = P.floorColor[2]; }
+    // ------------------------------------------------------------ anti-aliasing helper
+    // true when the pixel differs noticeably from a neighbour (silhouette, pane edge, particle...)
+    bool edgeAt(const std::vector<float>& v, int x, int y) const {
+        const float* c = &v[((size_t)y * outW + x) * 4];
+        const int nx[4] = {-1, 1, 0, 0}, ny[4] = {0, 0, -1, 1};
+        for (int k = 0; k < 4; k++) {
+            int qx = x + nx[k], qy = y + ny[k];
+            if (qx < 0 || qy < 0 || qx >= outW || qy >= outH) continue;
+            const float* n = &v[((size_t)qy * outW + qx) * 4];
+            float dA = std::fabs(c[3] - n[3]);
+            float dC = std::max(std::fabs(c[0] - n[0]), std::max(std::fabs(c[1] - n[1]), std::fabs(c[2] - n[2])));
+            if (std::max(dA, 0.5f * dC) > 0.05f) return true;
         }
-        float acc[4] = {0, 0, 0, 0};
-        for (int k = 0; k < ns; k++) {
-            float free_ = 1.f - subA[k];
-            acc[0] += subC[k][0] + free_ * F[0];
-            acc[1] += subC[k][1] + free_ * F[1];
-            acc[2] += subC[k][2] + free_ * F[2];
-            acc[3] += subA[k] + free_ * Fa;
-        }
-        for (int k = 0; k < 4; k++) out[k] = acc[k] / (float)ns;
+        return false;
     }
+};
 
-    // ------------------------------------------------------------ finishing: glow, chromatic aberration, grain
-    static void bilBuf(const std::vector<float>& s, int w, int h, float X, float Y, float o[4]) {
+// ---------------------------------------------------------------- finishing (full resolution)
+    inline void bilBuf(const std::vector<float>& s, int w, int h, float X, float Y, float o[4]) {
         float fx = X - 0.5f, fy = Y - 0.5f;
         int x0 = (int)std::floor(fx), y0 = (int)std::floor(fy);
         float tx = fx - x0, ty = fy - y0;
@@ -732,7 +830,7 @@ private:
         for (int k = 0; k < 4; k++) o[k] = (a[k] * (1 - tx) + b[k] * tx) * (1 - ty) + (c[k] * (1 - tx) + d[k] * tx) * ty;
     }
 
-    void post(std::vector<float>& img) const {
+    inline void postProcess(const Params& P, std::vector<float>& img, int outW, int outH, float rs, int seed) {
         const size_t n = (size_t)outW * outH;
         if (P.glowAmt > 0.f) {
             std::vector<float> g(n * 4, 0.f), t(n * 4, 0.f);
@@ -763,6 +861,26 @@ private:
                     }
             });
         }
+        if (P.rolloff > 0.f) { // highlight roll-off: overflow spills to white, then a soft shoulder
+            const float k = clamp01(P.rolloff), knee = 0.8f;
+            parallelRows(0, outH, [&](int a, int b) {
+                for (int y = a; y < b; y++)
+                    for (int x = 0; x < outW; x++) {
+                        float* o = &img[((size_t)y * outW + x) * 4];
+                        float Y = 0.2126f * o[0] + 0.7152f * o[1] + 0.0722f * o[2];
+                        if (Y > 1.f) {
+                            float t = clamp01((Y - 1.f) * 0.6f) * k;
+                            for (int c = 0; c < 3; c++) o[c] = o[c] * (1.f - t) + Y * t;
+                        }
+                        for (int c = 0; c < 3; c++) {
+                            float v = o[c];
+                            if (v > knee) v = knee + (1.f - knee) * (1.f - std::exp(-(v - knee) / (1.f - knee)));
+                            o[c] = o[c] * (1.f - k) + v * k;
+                        }
+                        o[3] = std::max(o[3], std::min(1.f, std::max(o[0], std::max(o[1], o[2]))));
+                    }
+            });
+        }
         if (P.grain > 0.f) {
             parallelRows(0, outH, [&](int a, int b) {
                 for (int y = a; y < b; y++)
@@ -774,13 +892,59 @@ private:
             });
         }
     }
-};
 
-// Convenience entry point.
+// Snap to Front: cross-fade onto the flat source frame (done at full resolution so it stays sharp).
+inline void snapBlend(const Params& P, const std::vector<FrameView>& frames, int w, int h, std::vector<float>& img) {
+    if (P.snap <= 0.f || frames.empty()) return;
+    const int N = (int)frames.size();
+    int cj = std::min(std::max(P.flip ? P.before : P.after, 0), N - 1);
+    float sn = clamp01(P.snap);
+    parallelRows(0, h, [&](int a, int b) {
+        for (int y = a; y < b; y++)
+            for (int x = 0; x < w; x++) {
+                float c[4];
+                frames[cj].bilinear((x + 0.5f) / w, (y + 0.5f) / h, c);
+                float* o = &img[((size_t)y * w + x) * 4];
+                for (int k = 0; k < 3; k++) o[k] = o[k] * (1.f - sn) + c[k] * c[3] * sn;
+                o[3] = o[3] * (1.f - sn) + c[3] * sn;
+            }
+    });
+}
+
+inline void upscaleBilinear(const std::vector<float>& src, int sw, int sh, std::vector<float>& dst, int dw, int dh) {
+    dst.assign((size_t)dw * dh * 4, 0.f);
+    parallelRows(0, dh, [&](int a, int b) {
+        for (int y = a; y < b; y++)
+            for (int x = 0; x < dw; x++) {
+                float o[4];
+                bilBuf(src, sw, sh, (x + 0.5f) * sw / (float)dw, (y + 0.5f) * sh / (float)dh, o);
+                float* d = &dst[((size_t)y * dw + x) * 4];
+                d[0] = o[0]; d[1] = o[1]; d[2] = o[2]; d[3] = o[3];
+            }
+    });
+}
+
+// Main entry point. scale < 1 renders the 3D part at a lower resolution (Draft) and upsamples it;
+// snap blend and finishing (glow, aberration, grain, roll-off) always run at full resolution.
+inline void renderFrameScaled(const Params& P, const std::vector<FrameView>& frames, int fullW, int fullH, float scale,
+                              float renderScale, uint32_t seed, std::vector<float>& out) {
+    if (scale >= 0.99f) {
+        Renderer r(P, frames, fullW, fullH, renderScale, seed);
+        r.run(out);
+    } else {
+        int sw = std::max(16, (int)std::lround(fullW * scale)), sh = std::max(16, (int)std::lround(fullH * scale));
+        std::vector<float> small;
+        Renderer r(P, frames, sw, sh, renderScale * scale, seed);
+        r.run(small);
+        upscaleBilinear(small, sw, sh, out, fullW, fullH);
+    }
+    snapBlend(P, frames, fullW, fullH, out);
+    postProcess(P, out, fullW, fullH, renderScale, (int)seed);
+}
+
 inline void renderFrame(const Params& P, const std::vector<FrameView>& frames, int outW, int outH,
                         float renderScale, uint32_t seed, std::vector<float>& out) {
-    Renderer r(P, frames, outW, outH, renderScale, seed);
-    r.run(out);
+    renderFrameScaled(P, frames, outW, outH, 1.f, renderScale, seed, out);
 }
 
 } // namespace chrono
