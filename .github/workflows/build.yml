@@ -7,7 +7,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest, ubuntu-latest]
+        # Two separate macOS pools: if one is saturated, the other usually works.
+        # Both produce a universal (Apple Silicon + Intel) bundle.
+        os: [windows-latest, ubuntu-latest, macos-15, macos-15-intel]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -15,5 +17,5 @@ jobs:
       - run: cmake --build build --config Release
       - uses: actions/upload-artifact@v4
         with:
-          name: ChronoVolume-${{ runner.os }}
+          name: ChronoVolume-${{ matrix.os }}
           path: build/ChronoVolume.ofx.bundle
